@@ -1,12 +1,21 @@
 """
 Live market scanner for NASDAQ-100 + S&P 500.
 
-Runs every 15-30 min during US market hours via GitHub Actions.
-Tier 1 (this script): cheap rule-based scan of ALL tickers (price move %,
-volume spike). No LLM calls, no API keys needed for market data.
-Tier 2 (optional): when a rule fires, sends a fast Telegram alert AND
-(if enabled) shells out to the daily_stock_analysis project for a full
-AI decision dashboard on just that one ticker.
+Two modes, controlled by the RUN_MODE env var:
+
+- "intraday" (default): runs every 15-30 min during US market hours via
+  live_scan.yml. Cheap rule-based scan of ALL tickers using 15-min bars
+  (price move %, volume spike). Sends an alert the moment a rule fires.
+
+- "daily_summary": runs once, after market close, via daily_summary.yml.
+  Uses each ticker's full daily candle (yfinance intraday data goes stale
+  once the market's closed, so this looks at settled end-of-day data
+  instead) and sends one consolidated digest of top gainers/losers/volume
+  movers, rather than repeated per-ticker pings.
+
+In both modes, Tier 2 (optional): shells out to the daily_stock_analysis
+project for a full AI decision dashboard on the most significant tickers,
+capped by a shared daily budget (DEEP_ANALYSIS_DAILY_LIMIT).
 """
 
 import json
@@ -43,6 +52,13 @@ DEEP_ANALYSIS_REPO_DIR = os.environ.get("DEEP_ANALYSIS_REPO_DIR", "daily_stock_a
 # analysis can itself involve more than one underlying LLM call (search,
 # integrity retries, etc.), so this counts tickers, not raw API calls.
 DEEP_ANALYSIS_DAILY_LIMIT = int(os.environ.get("DEEP_ANALYSIS_DAILY_LIMIT", "40"))
+
+# "intraday" (default): the every-15-min scan during market hours above.
+# "daily_summary": a once-a-day digest using the prior session's full daily
+# candle, meant to run after market close (see run_daily_summary()).
+RUN_MODE = os.environ.get("RUN_MODE", "intraday")
+DAILY_SUMMARY_TOP_N = int(os.environ.get("DAILY_SUMMARY_TOP_N", "10"))
+DAILY_SUMMARY_DEEP_COUNT = int(os.environ.get("DAILY_SUMMARY_DEEP_COUNT", "5"))
 
 
 def is_market_open_now() -> bool:
@@ -223,7 +239,119 @@ def score_trigger(t: dict) -> float:
     return price_score + volume_score
 
 
-def main() -> None:
+def scan_daily(tickers: list, batch_size: int = 100) -> list:
+    """Like scan_batch(), but uses the prior session's full daily candle
+    instead of intraday 15-min bars. Meant to run once, after market close,
+    when yfinance's daily data has settled. Returns ALL tickers with valid
+    data (not threshold-gated) -- run_daily_summary() picks the top movers
+    from this, since it's a once-a-day digest rather than repeated pings."""
+    results = []
+    for i in range(0, len(tickers), batch_size):
+        batch = tickers[i : i + batch_size]
+        try:
+            data = yf.download(
+                tickers=batch,
+                period="1mo",
+                interval="1d",
+                group_by="ticker",
+                threads=True,
+                progress=False,
+                auto_adjust=True,
+            )
+        except Exception as e:
+            print(f"WARN: daily batch download failed for {batch[:3]}...: {e}", file=sys.stderr)
+            continue
+
+        for ticker in batch:
+            try:
+                df = data[ticker] if len(batch) > 1 else data
+                df = df.dropna()
+                if len(df) < 6:
+                    continue
+
+                latest = df.iloc[-1]
+                prev_close = df.iloc[-2]["Close"]
+                if not prev_close:
+                    continue
+                pct_change = (latest["Close"] - prev_close) / prev_close * 100
+
+                avg_volume = df["Volume"].iloc[-6:-1].mean()
+                volume_ratio = latest["Volume"] / avg_volume if avg_volume else 0
+
+                results.append(
+                    {
+                        "ticker": ticker,
+                        "price": round(float(latest["Close"]), 2),
+                        "pct_change": round(float(pct_change), 2),
+                        "volume_ratio": round(float(volume_ratio), 2),
+                        "reasons": [],
+                    }
+                )
+            except Exception as e:
+                print(f"WARN: failed to process {ticker} (daily): {e}", file=sys.stderr)
+                continue
+
+    return results
+
+
+def build_summary_message(gainers: list, losers: list, volume_movers: list) -> str:
+    lines = [f"*Daily Summary — {date.today().isoformat()}*\n"]
+
+    lines.append("*Top Gainers*")
+    for t in gainers:
+        lines.append(f"  {t['ticker']}: ${t['price']} ({t['pct_change']:+.1f}%)")
+
+    lines.append("\n*Top Losers*")
+    for t in losers:
+        lines.append(f"  {t['ticker']}: ${t['price']} ({t['pct_change']:+.1f}%)")
+
+    lines.append("\n*Volume Spikes*")
+    for t in volume_movers:
+        lines.append(f"  {t['ticker']}: {t['volume_ratio']:.1f}x avg volume ({t['pct_change']:+.1f}%)")
+
+    return "\n".join(lines)
+
+
+def run_daily_summary() -> None:
+    """Runs once, after market close (see the separate cron in
+    daily_summary.yml), regardless of is_market_open_now(). Uses the prior
+    session's full daily candle instead of intraday bars, sends one
+    consolidated digest, then runs deep analysis on just the top few
+    tickers by significance (see score_trigger)."""
+    tickers = get_universe()
+    print(f"Daily summary: scanning {len(tickers)} tickers using prior session's daily candle...")
+
+    results = scan_daily(tickers)
+    print(f"Got valid daily data for {len(results)} tickers.")
+    if not results:
+        print("No data -- likely no trading session available yet, skipping.")
+        return
+
+    by_change = sorted(results, key=lambda t: t["pct_change"], reverse=True)
+    gainers = by_change[:DAILY_SUMMARY_TOP_N]
+    losers = list(reversed(by_change[-DAILY_SUMMARY_TOP_N:]))
+    volume_movers = sorted(results, key=lambda t: t["volume_ratio"], reverse=True)[:DAILY_SUMMARY_TOP_N]
+
+    send_telegram(build_summary_message(gainers, losers, volume_movers))
+
+    # Dedup the union of movers, ranked by significance, deep-analyze only
+    # the top handful so a slow news day doesn't burn the whole daily
+    # LLM budget on marginal names.
+    union = {t["ticker"]: t for t in gainers + losers + volume_movers}
+    ranked = sorted(union.values(), key=score_trigger, reverse=True)
+
+    state = load_state()
+    top_for_deep_dive = ranked[:DAILY_SUMMARY_DEEP_COUNT]
+    for t in top_for_deep_dive:
+        remaining_budget = DEEP_ANALYSIS_DAILY_LIMIT - state["deep_analysis_count"]
+        if DEEP_ANALYSIS_ENABLED and remaining_budget > 0:
+            run_deep_analysis(t["ticker"])
+            state["deep_analysis_count"] += 1
+    save_state(state)
+    print(f"Daily summary done. Deep-dived {len(top_for_deep_dive)} tickers.")
+
+
+def run_intraday() -> None:
     if not is_market_open_now():
         print("Market closed (or outside 9:30-16:00 ET), skipping run.")
         return
@@ -265,6 +393,13 @@ def main() -> None:
     print(
         f"Done. Deep analyses used today: {state['deep_analysis_count']}/{DEEP_ANALYSIS_DAILY_LIMIT}."
     )
+
+
+def main() -> None:
+    if RUN_MODE == "daily_summary":
+        run_daily_summary()
+    else:
+        run_intraday()
 
 
 if __name__ == "__main__":
