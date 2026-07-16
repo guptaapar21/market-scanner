@@ -229,7 +229,11 @@ def run_deep_analysis(ticker: str) -> None:
 
     try:
         subprocess.run(
-            [sys.executable, "main.py", "--stocks", ticker],
+            # --no-market-review: this call only wants ticker's dashboard,
+            # not a full market-wide recap (main.py runs both by default) --
+            # otherwise every deep-dived ticker re-triggers a whole extra
+            # market review, which is what was flooding Telegram.
+            [sys.executable, "main.py", "--stocks", ticker, "--no-market-review"],
             cwd=DEEP_ANALYSIS_REPO_DIR,
             check=True,
             timeout=600,
