@@ -18,6 +18,7 @@ project for a full AI decision dashboard on the most significant tickers,
 capped by a shared daily budget (DEEP_ANALYSIS_DAILY_LIMIT).
 """
 
+import io
 import json
 import os
 import subprocess
@@ -73,6 +74,19 @@ def is_market_open_now() -> bool:
     return open_t <= now <= close_t
 
 
+def _fetch_wikipedia_tables(url: str) -> list:
+    """pd.read_html() alone sends no User-Agent, and Wikipedia now 403s
+    requests that look bot-like. Fetch the page ourselves with a normal
+    browser User-Agent first, then hand the HTML to pandas to parse."""
+    resp = requests.get(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+        timeout=20,
+    )
+    resp.raise_for_status()
+    return pd.read_html(io.StringIO(resp.text))
+
+
 def get_universe(force_refresh: bool = False) -> list:
     """S&P 500 + Nasdaq-100 tickers, deduped, fetched from Wikipedia with a
     same-day local cache so we don't hit Wikipedia every 15 minutes."""
@@ -83,13 +97,13 @@ def get_universe(force_refresh: bool = False) -> list:
 
     tickers = set()
     try:
-        sp500 = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
+        sp500 = _fetch_wikipedia_tables("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
         tickers.update(sp500["Symbol"].astype(str).str.replace(".", "-", regex=False))
     except Exception as e:
         print(f"WARN: failed to fetch S&P 500 list: {e}", file=sys.stderr)
 
     try:
-        tables = pd.read_html("https://en.wikipedia.org/wiki/Nasdaq-100")
+        tables = _fetch_wikipedia_tables("https://en.wikipedia.org/wiki/Nasdaq-100")
         table = next(t for t in tables if "Ticker" in t.columns or "Symbol" in t.columns)
         col = "Ticker" if "Ticker" in table.columns else "Symbol"
         tickers.update(table[col].astype(str).str.replace(".", "-", regex=False))
