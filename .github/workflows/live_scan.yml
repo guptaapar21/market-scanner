@@ -1,0 +1,65 @@
+name: Live Market Scanner
+
+on:
+  schedule:
+    # Every 15 min, 13:00-21:30 UTC. This window covers 9:00-17:30 ET
+    # across both EST and EDT (daylight saving), so it's intentionally
+    # wider than the real 9:30-16:00 ET session -- scan.py checks the
+    # actual market hours in Python and exits immediately if closed,
+    # so the extra cron minutes just result in quick no-op runs.
+    - cron: "*/15 13-21 * * 1-5"
+  workflow_dispatch: {}  # lets you click "Run workflow" manually to test
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: live-scanner
+      cancel-in-progress: false
+    steps:
+      - name: Checkout this scanner repo
+        uses: actions/checkout@v4
+
+      - name: Checkout daily_stock_analysis (your fork)
+        uses: actions/checkout@v4
+        with:
+          # Set this in: Settings -> Secrets and variables -> Actions -> Variables tab
+          # Value looks like: yourusername/daily_stock_analysis
+          repository: ${{ vars.DSA_REPO_PATH }}
+          path: daily_stock_analysis
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install scanner dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install daily_stock_analysis dependencies
+        run: pip install -r daily_stock_analysis/requirements.txt
+
+      - name: Run scanner (+ deep analysis on triggers)
+        env:
+          # single bot/chat -- used for both fast alerts and AI dashboards
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # --- scan thresholds ---
+          PRICE_MOVE_THRESHOLD_PCT: "3.0"
+          VOLUME_SPIKE_MULTIPLE: "3.0"
+          # --- Tier 2 deep AI analysis ---
+          DEEP_ANALYSIS_ENABLED: "true"
+          DEEP_ANALYSIS_REPO_DIR: "daily_stock_analysis"
+          # Max tickers per day to run full AI analysis on -- the
+          # strongest movers get this budget first (see score_trigger
+          # in scan.py). Raise/lower based on your Gemini free-tier cap.
+          DEEP_ANALYSIS_DAILY_LIMIT: "40"
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python scan.py
+
+      - name: Commit updated state
+        run: |
+          git config user.name "live-scanner-bot"
+          git config user.email "actions@github.com"
+          git add state/
+          git diff --quiet --cached || git commit -m "Update scanner state [skip ci]"
+          git push
