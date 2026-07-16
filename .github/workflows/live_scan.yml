@@ -13,6 +13,8 @@ on:
 jobs:
   scan:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     concurrency:
       group: live-scanner
       cancel-in-progress: false
@@ -54,6 +56,15 @@ jobs:
           # in scan.py). Raise/lower based on your Gemini free-tier cap.
           DEEP_ANALYSIS_DAILY_LIMIT: "40"
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # daily_stock_analysis defaults to Chinese output -- force English
+          REPORT_LANGUAGE: "en"
+          # defaults to "cn" (A-shares) if unset -- forces it to skip the
+          # irrelevant Chinese A-share market review on every US-stock run
+          MARKET_REVIEW_REGION: "us"
+          # free public SearXNG instances are heavily rate-limited/blocked
+          # in practice -- Tavily's free tier (1,000 searches/mo, no card)
+          # is far more reliable for actual news/catalyst grounding
+          TAVILY_API_KEYS: ${{ secrets.TAVILY_API_KEYS }}
         run: python scan.py
 
       - name: Commit updated state
