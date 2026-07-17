@@ -21,6 +21,7 @@ capped by a shared daily budget (DEEP_ANALYSIS_DAILY_LIMIT).
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import date, datetime
@@ -38,6 +39,11 @@ MARKET_CLOSE = (16, 0)
 
 PRICE_MOVE_THRESHOLD_PCT = float(os.environ.get("PRICE_MOVE_THRESHOLD_PCT", "3.0"))
 VOLUME_SPIKE_MULTIPLE = float(os.environ.get("VOLUME_SPIKE_MULTIPLE", "3.0"))
+# "and" (default): only alert when a stock crosses BOTH the price and volume
+# thresholds together -- cuts out weak single-signal noise (e.g. a 3% move
+# on below-average volume, or a volume spike with barely any price move).
+# "or": alert on either alone (much noisier, the old default behavior).
+TRIGGER_LOGIC = os.environ.get("TRIGGER_LOGIC", "and").lower()
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
@@ -53,6 +59,14 @@ DEEP_ANALYSIS_REPO_DIR = os.environ.get("DEEP_ANALYSIS_REPO_DIR", "daily_stock_a
 # analysis can itself involve more than one underlying LLM call (search,
 # integrity retries, etc.), so this counts tickers, not raw API calls.
 DEEP_ANALYSIS_DAILY_LIMIT = int(os.environ.get("DEEP_ANALYSIS_DAILY_LIMIT", "40"))
+# When True (default): a triggered ticker only gets a Telegram alert if it
+# also gets an AI dashboard. With ~600 tickers, more can cross the trigger
+# thresholds on a busy day than the daily AI budget can cover -- rather
+# than flooding you with bare "moved X%, no analysis" pings for the
+# leftovers, those are silently dropped and only counted internally.
+# Set to "false" to go back to alerting on every trigger regardless of
+# whether AI analysis is available for it.
+REQUIRE_AI_FOR_ALERT = os.environ.get("REQUIRE_AI_FOR_ALERT", "true").lower() == "true"
 
 # "intraday" (default): the every-15-min scan during market hours above.
 # "daily_summary": a once-a-day digest using the prior session's full daily
@@ -193,14 +207,19 @@ def scan_batch(tickers: list, batch_size: int = 100) -> list:
                 avg_volume = df["Volume"].iloc[:-1].mean()
                 volume_ratio = latest["Volume"] / avg_volume if avg_volume else 0
 
+                price_hit = abs(pct_change) >= PRICE_MOVE_THRESHOLD_PCT
+                volume_hit = volume_ratio >= VOLUME_SPIKE_MULTIPLE
+
                 reasons = []
-                if abs(pct_change) >= PRICE_MOVE_THRESHOLD_PCT:
+                if price_hit:
                     direction = "up" if pct_change > 0 else "down"
                     reasons.append(f"moved {direction} {abs(pct_change):.1f}% today")
-                if volume_ratio >= VOLUME_SPIKE_MULTIPLE:
+                if volume_hit:
                     reasons.append(f"volume {volume_ratio:.1f}x average")
 
-                if reasons:
+                should_trigger = (price_hit and volume_hit) if TRIGGER_LOGIC == "and" else (price_hit or volume_hit)
+
+                if should_trigger:
                     triggers.append(
                         {
                             "ticker": ticker,
@@ -217,15 +236,69 @@ def scan_batch(tickers: list, batch_size: int = 100) -> list:
     return triggers
 
 
+def summarize_report_for_telegram(report_path: Path, ticker: str) -> str:
+    """Pull just the essentials out of daily_stock_analysis's generated
+    report (rating, one-line decision, position guidance, top bull/bear
+    signal) instead of forwarding its full multi-section dashboard, which
+    is unreadable as a Telegram message on a phone screen. Best-effort
+    parsing against the current report format -- falls back to a short
+    generic message if the structure doesn't match, rather than failing."""
+    try:
+        text = report_path.read_text(encoding="utf-8")
+    except Exception:
+        return f"*{ticker}* — AI dashboard generated, but the report file couldn't be read for a summary."
+
+    # Use the LAST "One-line Decision" in the file, since reports can
+    # accumulate multiple stocks' sections across a day's runs -- the
+    # most recently appended one is this ticker's.
+    decision_matches = list(re.finditer(r"One-line Decision:\s*(.+)", text))
+    if not decision_matches:
+        return f"*{ticker}* — AI dashboard generated, but couldn't extract a short summary. Full report is in your fork's reports/ folder."
+
+    last = decision_matches[-1]
+    decision_line = last.group(1).strip()
+
+    window_before = text[max(0, last.start() - 800):last.start()]
+    rating_match = re.search(r"\b(Buy|Watch|Sell|Reduce)\b\s*\|\s*([A-Za-z ]+)", window_before)
+    rating = f"{rating_match.group(1)} | {rating_match.group(2).strip()}" if rating_match else "See dashboard"
+    score_match = re.search(r"Score (\d+)", window_before)
+    score = f" (Score {score_match.group(1)})" if score_match else ""
+
+    window_after = text[last.end():last.end() + 800]
+    no_position = re.search(r"No Position\s*\|\s*(.+?)\s*\|", window_after)
+    holding = re.search(r"Holding\s*\|\s*(.+?)\s*\|", window_after)
+
+    bull_match = re.search(r"Strongest Bullish Signal:\s*(.+)", text)
+    bear_match = re.search(r"Strongest Bearish Signal:\s*(.+)", text)
+
+    lines = [f"*{ticker}* — {rating}{score}", f"_{decision_line}_"]
+    if no_position:
+        lines.append(f"No position: {no_position.group(1).strip()}")
+    if holding:
+        lines.append(f"Holding: {holding.group(1).strip()}")
+    if bull_match:
+        lines.append(f"Bull signal: {bull_match.group(1).strip()}")
+    if bear_match:
+        lines.append(f"Bear signal: {bear_match.group(1).strip()}")
+
+    return "\n".join(lines)
+
+
 def run_deep_analysis(ticker: str) -> None:
     """Shell out to daily_stock_analysis's own documented CLI for one ticker.
-    That project handles its own LLM call and pushes to the SAME Telegram
-    bot/chat as the fast alert above, since it inherits TELEGRAM_BOT_TOKEN
-    and TELEGRAM_CHAT_ID from this process's environment by default -- no
-    extra config needed, both messages land in the same chat."""
+
+    Deliberately does NOT let that process push its own Telegram message --
+    its dashboards are too long to read comfortably on a phone. Instead,
+    TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID are stripped from its environment
+    (so it can't self-notify), and once it finishes, this reads the report
+    file it generated and sends a short condensed summary via send_telegram()."""
     if not Path(DEEP_ANALYSIS_REPO_DIR).exists():
         print(f"WARN: deep analysis repo not found at {DEEP_ANALYSIS_REPO_DIR}, skipping", file=sys.stderr)
         return
+
+    env = os.environ.copy()
+    env.pop("TELEGRAM_BOT_TOKEN", None)
+    env.pop("TELEGRAM_CHAT_ID", None)
 
     try:
         subprocess.run(
@@ -237,9 +310,14 @@ def run_deep_analysis(ticker: str) -> None:
             cwd=DEEP_ANALYSIS_REPO_DIR,
             check=True,
             timeout=600,
+            env=env,
         )
     except Exception as e:
         print(f"WARN: deep analysis failed for {ticker}: {e}", file=sys.stderr)
+        return
+
+    report_path = Path(DEEP_ANALYSIS_REPO_DIR) / "reports" / f"report_{datetime.now(NY_TZ).strftime('%Y%m%d')}.md"
+    send_telegram(summarize_report_for_telegram(report_path, ticker))
 
 
 def score_trigger(t: dict) -> float:
@@ -388,9 +466,18 @@ def run_intraday() -> None:
     new_triggers.sort(key=score_trigger, reverse=True)
     print(f"{len(new_triggers)} are new today (not yet alerted), sorted by significance.")
 
+    skipped_count = 0
     for t in new_triggers:
         remaining_budget = DEEP_ANALYSIS_DAILY_LIMIT - state["deep_analysis_count"]
         will_run_deep = DEEP_ANALYSIS_ENABLED and remaining_budget > 0
+
+        if REQUIRE_AI_FOR_ALERT and DEEP_ANALYSIS_ENABLED and not will_run_deep:
+            # Budget's used up for today -- mark it seen so we don't
+            # re-evaluate it every 15 min, but don't send a bare
+            # numbers-only ping with no analysis behind it.
+            state["alerted"][t["ticker"]] = datetime.now(NY_TZ).isoformat()
+            skipped_count += 1
+            continue
 
         msg = (
             f"*{t['ticker']}* alert\n"
@@ -409,7 +496,8 @@ def run_intraday() -> None:
 
     save_state(state)
     print(
-        f"Done. Deep analyses used today: {state['deep_analysis_count']}/{DEEP_ANALYSIS_DAILY_LIMIT}."
+        f"Done. Deep analyses used today: {state['deep_analysis_count']}/{DEEP_ANALYSIS_DAILY_LIMIT}. "
+        f"Silently skipped (no AI budget left): {skipped_count}."
     )
 
 
