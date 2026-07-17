@@ -460,7 +460,7 @@ def run_daily_summary() -> None:
     top_for_deep_dive = ranked[:DAILY_SUMMARY_DEEP_COUNT]
     for t in top_for_deep_dive:
         remaining_budget = DEEP_ANALYSIS_DAILY_LIMIT - state["deep_analysis_count"]
-            if DEEP_ANALYSIS_ENABLED and remaining_budget > 0:
+        if DEEP_ANALYSIS_ENABLED and remaining_budget > 0:
             run_deep_analysis(t["ticker"])
             state["deep_analysis_count"] += 1
     save_state(state)
