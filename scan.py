@@ -241,47 +241,61 @@ def summarize_report_for_telegram(report_path: Path, ticker: str) -> str:
     report (rating, one-line decision, position guidance, top bull/bear
     signal) instead of forwarding its full multi-section dashboard, which
     is unreadable as a Telegram message on a phone screen. Best-effort
-    parsing against the current report format -- falls back to a short
-    generic message if the structure doesn't match, rather than failing."""
+    parsing against the current report format -- if the expected fields
+    aren't found (report format varies, or REPORT_LANGUAGE fell back to
+    Chinese for one field), falls back to sending a raw excerpt directly,
+    since the reports/ folder itself is inside the ephemeral GitHub
+    Actions runner and is NOT accessible to the user after the job ends --
+    pointing them to "check the reports folder" would be a dead end."""
     try:
         text = report_path.read_text(encoding="utf-8")
     except Exception:
-        return f"*{ticker}* — AI dashboard generated, but the report file couldn't be read for a summary."
+        return f"*{ticker}* — AI dashboard generated, but the report file couldn't be read."
 
-    # Use the LAST "One-line Decision" in the file, since reports can
-    # accumulate multiple stocks' sections across a day's runs -- the
-    # most recently appended one is this ticker's.
-    decision_matches = list(re.finditer(r"One-line Decision:\s*(.+)", text))
-    if not decision_matches:
-        return f"*{ticker}* — AI dashboard generated, but couldn't extract a short summary. Full report is in your fork's reports/ folder."
+    # Case-insensitive, and accept either the English label or the
+    # Chinese one (report_language config doesn't always cover every
+    # field depending on daily_stock_analysis's version).
+    decision_matches = list(re.finditer(r"(?:One-line Decision|一句话决策)[:：]\s*(.+)", text, re.IGNORECASE))
 
-    last = decision_matches[-1]
-    decision_line = last.group(1).strip()
+    if decision_matches:
+        last = decision_matches[-1]
+        decision_line = last.group(1).strip()
 
-    window_before = text[max(0, last.start() - 800):last.start()]
-    rating_match = re.search(r"\b(Buy|Watch|Sell|Reduce)\b\s*\|\s*([A-Za-z ]+)", window_before)
-    rating = f"{rating_match.group(1)} | {rating_match.group(2).strip()}" if rating_match else "See dashboard"
-    score_match = re.search(r"Score (\d+)", window_before)
-    score = f" (Score {score_match.group(1)})" if score_match else ""
+        window_before = text[max(0, last.start() - 800):last.start()]
+        rating_match = re.search(r"\b(Buy|Watch|Sell|Reduce)\b\s*\|\s*([A-Za-z ]+)", window_before, re.IGNORECASE)
+        rating = f"{rating_match.group(1)} | {rating_match.group(2).strip()}" if rating_match else "See dashboard"
+        score_match = re.search(r"Score[:\s]+(\d+)", window_before, re.IGNORECASE)
+        score = f" (Score {score_match.group(1)})" if score_match else ""
 
-    window_after = text[last.end():last.end() + 800]
-    no_position = re.search(r"No Position\s*\|\s*(.+?)\s*\|", window_after)
-    holding = re.search(r"Holding\s*\|\s*(.+?)\s*\|", window_after)
+        window_after = text[last.end():last.end() + 800]
+        no_position = re.search(r"No Position\s*\|\s*(.+?)\s*\|", window_after, re.IGNORECASE)
+        holding = re.search(r"Holding\s*\|\s*(.+?)\s*\|", window_after, re.IGNORECASE)
+        bull_match = re.search(r"Strongest Bullish Signal:\s*(.+)", text, re.IGNORECASE)
+        bear_match = re.search(r"Strongest Bearish Signal:\s*(.+)", text, re.IGNORECASE)
 
-    bull_match = re.search(r"Strongest Bullish Signal:\s*(.+)", text)
-    bear_match = re.search(r"Strongest Bearish Signal:\s*(.+)", text)
+        lines = [f"*{ticker}* — {rating}{score}", f"_{decision_line}_"]
+        if no_position:
+            lines.append(f"No position: {no_position.group(1).strip()}")
+        if holding:
+            lines.append(f"Holding: {holding.group(1).strip()}")
+        if bull_match:
+            lines.append(f"Bull signal: {bull_match.group(1).strip()}")
+        if bear_match:
+            lines.append(f"Bear signal: {bear_match.group(1).strip()}")
+        return "\n".join(lines)
 
-    lines = [f"*{ticker}* — {rating}{score}", f"_{decision_line}_"]
-    if no_position:
-        lines.append(f"No position: {no_position.group(1).strip()}")
-    if holding:
-        lines.append(f"Holding: {holding.group(1).strip()}")
-    if bull_match:
-        lines.append(f"Bull signal: {bull_match.group(1).strip()}")
-    if bear_match:
-        lines.append(f"Bear signal: {bear_match.group(1).strip()}")
+    # Couldn't find the expected fields -- send a raw excerpt instead of a
+    # dead-end pointer, since this file won't exist anywhere after this
+    # job finishes. Prefer the section near this ticker's name if we can
+    # find it, otherwise just the tail of the file (most recently written).
+    ticker_pos = text.rfind(f"({ticker})")
+    if ticker_pos != -1:
+        excerpt = text[ticker_pos:ticker_pos + 900]
+    else:
+        excerpt = text[-900:]
+    excerpt = excerpt.strip()
 
-    return "\n".join(lines)
+    return f"*{ticker}* — AI dashboard generated, couldn't build a short summary. Raw excerpt:\n\n{excerpt}"
 
 
 def find_latest_report(reports_dir: Path):
