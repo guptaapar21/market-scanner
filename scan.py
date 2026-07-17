@@ -284,6 +284,22 @@ def summarize_report_for_telegram(report_path: Path, ticker: str) -> str:
     return "\n".join(lines)
 
 
+def find_latest_report(reports_dir: Path):
+    """Return the most recently modified report_*.md file, or None.
+
+    Deliberately does NOT guess the filename from today's date -- the
+    report filename's date comes from daily_stock_analysis's own system
+    clock, which may not agree with NY_TZ's calendar date (e.g. a run
+    close to midnight UTC can have NY still on the previous day), causing
+    a filename guess to silently miss the file that was actually just
+    written. Picking the newest file right after the subprocess finishes
+    sidesteps that entirely."""
+    if not reports_dir.exists():
+        return None
+    reports = sorted(reports_dir.glob("report_*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return reports[0] if reports else None
+
+
 def run_deep_analysis(ticker: str) -> None:
     """Shell out to daily_stock_analysis's own documented CLI for one ticker.
 
@@ -316,7 +332,11 @@ def run_deep_analysis(ticker: str) -> None:
         print(f"WARN: deep analysis failed for {ticker}: {e}", file=sys.stderr)
         return
 
-    report_path = Path(DEEP_ANALYSIS_REPO_DIR) / "reports" / f"report_{datetime.now(NY_TZ).strftime('%Y%m%d')}.md"
+    reports_dir = Path(DEEP_ANALYSIS_REPO_DIR) / "reports"
+    report_path = find_latest_report(reports_dir)
+    if report_path is None:
+        send_telegram(f"*{ticker}* — AI dashboard generated, but no report file was found to summarize.")
+        return
     send_telegram(summarize_report_for_telegram(report_path, ticker))
 
 
@@ -440,7 +460,7 @@ def run_daily_summary() -> None:
     top_for_deep_dive = ranked[:DAILY_SUMMARY_DEEP_COUNT]
     for t in top_for_deep_dive:
         remaining_budget = DEEP_ANALYSIS_DAILY_LIMIT - state["deep_analysis_count"]
-        if DEEP_ANALYSIS_ENABLED and remaining_budget > 0:
+            if DEEP_ANALYSIS_ENABLED and remaining_budget > 0:
             run_deep_analysis(t["ticker"])
             state["deep_analysis_count"] += 1
     save_state(state)
