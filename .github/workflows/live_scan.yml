@@ -55,7 +55,12 @@ jobs:
           # strongest movers get this budget first (see score_trigger
           # in scan.py). Raise/lower based on your Gemini free-tier cap.
           DEEP_ANALYSIS_DAILY_LIMIT: "40"
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # comma-separated, e.g. "key1,key2" -- daily_stock_analysis
+          # rotates through these automatically. Note: keys from the SAME
+          # Google account/project share one quota pool and won't add
+          # capacity; only keys from separate Google accounts genuinely
+          # increase your daily budget.
+          GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
           # daily_stock_analysis defaults to Chinese output -- force English
           REPORT_LANGUAGE: "en"
           # defaults to "cn" (A-shares) if unset -- forces it to skip the
