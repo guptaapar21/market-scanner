@@ -46,7 +46,7 @@ jobs:
           DEEP_ANALYSIS_ENABLED: "true"
           DEEP_ANALYSIS_REPO_DIR: "daily_stock_analysis"
           DEEP_ANALYSIS_DAILY_LIMIT: "40"
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
           REPORT_LANGUAGE: "en"
           MARKET_REVIEW_REGION: "us"
           TAVILY_API_KEYS: ${{ secrets.TAVILY_API_KEYS }}
